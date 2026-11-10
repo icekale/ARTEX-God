@@ -26,6 +26,10 @@ const (
 	maxArchiveBytes = int64(1 << 47) // 128 TiB safety ceiling for corrupt headers.
 )
 
+// errArchiveNotRegular means the opened inode is not a regular file. The caller
+// skips it instead of reading: device, FIFO, and socket payloads must not be copied.
+var errArchiveNotRegular = errors.New("task archive source is not a regular file")
+
 type archiveFileMove struct {
 	Source   string `json:"source"`
 	Relative string `json:"relative"`
@@ -577,32 +581,9 @@ func writeTaskArchivePackage(path, payloadDir string, snapshot *pgdb.TaskArchive
 		if err != nil {
 			return err
 		}
-		if info.Mode()&os.ModeSymlink != 0 {
-			// 归档格式端到端只支持普通文件与目录（解包端对其它类型直接报错），
-			// 无法还原符号链接。跳过而非整包失败：不读取链接目标(lstat，不越出目录树)，
-			// 也不写入 symlink 条目；链接指向树内时目标文件本身仍会被单独遍历归档。
-			log.Printf("[task-archive] 跳过符号链接（归档不支持，不影响其它文件）：%s", current)
-			return nil
-		}
-		header, err := tar.FileInfoHeader(info, "")
-		if err != nil {
-			return err
-		}
-		header.Name = filepath.ToSlash(relative)
-		if err := tarWriter.WriteHeader(header); err != nil {
-			return err
-		}
-		if entry.IsDir() {
-			return nil
-		}
-		originalSize += info.Size()
-		input, err := os.Open(current)
-		if err != nil {
-			return err
-		}
-		_, copyErr := io.Copy(tarWriter, input)
-		closeErr := input.Close()
-		return errors.Join(copyErr, closeErr)
+		n, err := writeArchivePayloadEntry(tarWriter, current, relative, info)
+		originalSize += n
+		return err
 	})
 	if walkErr != nil {
 		_ = tarWriter.Close()
@@ -636,6 +617,72 @@ func writeTaskArchivePackage(path, payloadDir string, snapshot *pgdb.TaskArchive
 	}
 	committed = true
 	return originalSize, compressedSize, checksum, nil
+}
+
+// writeArchivePayloadEntry stores one walk entry. The on-disk format only
+// round-trips regular files and directories; the extractor rejects every other
+// tar type. Symlinks, devices, FIFOs, and sockets are skipped with no payload
+// read, the same choice already made for symlinks. Reading a character device
+// such as dev/console (5:1) otherwise blocks in the poller (O_NONBLOCK, EPOLLIN)
+// and the .tar.zst.partial output stops growing.
+//
+// A path that was a regular file at lstat can be replaced before open. The open
+// helper uses O_NOFOLLOW|O_NONBLOCK and fstats before any Read, so that race
+// cannot follow a symlink or block on a FIFO/device.
+func writeArchivePayloadEntry(tarWriter *tar.Writer, current, relative string, info fs.FileInfo) (int64, error) {
+	mode := info.Mode()
+	if !mode.IsRegular() && !mode.IsDir() {
+		if mode&os.ModeSymlink != 0 {
+			// 不读取链接目标（lstat，不越出目录树），也不写入 symlink 条目。
+			// 链接指向树内时，目标文件本身仍会在遍历到它时单独归档。
+			log.Printf("[task-archive] 跳过符号链接（归档不支持，不影响其它文件）：%s", current)
+		} else {
+			log.Printf("[task-archive] 跳过特殊文件（归档只支持普通文件与目录，不读取内容）：%s", current)
+		}
+		return 0, nil
+	}
+
+	headerInfo := info
+	var input *os.File
+	if mode.IsRegular() {
+		opened, openedInfo, openErr := openArchiveRegular(current)
+		if openErr != nil {
+			if archiveOpenSkippable(openErr) {
+				log.Printf("[task-archive] 跳过特殊文件（打开时已不是普通文件，不读取内容）：%s: %v", current, openErr)
+				return 0, nil
+			}
+			return 0, openErr
+		}
+		input = opened
+		headerInfo = openedInfo
+	}
+
+	header, err := tar.FileInfoHeader(headerInfo, "")
+	if err != nil {
+		if input != nil {
+			_ = input.Close()
+		}
+		return 0, err
+	}
+	header.Name = filepath.ToSlash(relative)
+	if err := tarWriter.WriteHeader(header); err != nil {
+		if input != nil {
+			_ = input.Close()
+		}
+		return 0, err
+	}
+	if input == nil {
+		return 0, nil
+	}
+	written, copyErr := io.CopyN(tarWriter, input, header.Size)
+	closeErr := input.Close()
+	if copyErr != nil && !errors.Is(copyErr, io.EOF) {
+		return 0, errors.Join(copyErr, closeErr)
+	}
+	if written != header.Size {
+		return 0, errors.Join(io.ErrUnexpectedEOF, closeErr)
+	}
+	return header.Size, closeErr
 }
 
 func extractTaskArchivePackage(path, expectedSHA, destination string) error {
